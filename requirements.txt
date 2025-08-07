@@ -6,3 +6,4 @@ openpyxl
 matplotlib
 scikit-learn
 sentence-transformers
+dateparser
