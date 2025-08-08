@@ -1184,24 +1184,38 @@ SEMANTIC_MAPPINGS = {
     # }
 }
 
-def get_total_spend_by_brand_and_channel(df, brand, channel):
-    if "Brand" not in df.columns or "Channel" not in df.columns or "Amount" not in df.columns:
-        return "Missing one or more required columns: 'Brand', 'Channel', or 'Amount'."
+def get_total_spend_by_brand_and_channel(df, brand, channel_or_source):
+    """
+    Supports queries like 'total online spend by BMW'.
+    Uses 'Source' (ONLINE/OFFLINE) when appropriate; otherwise falls back to 'Channel'.
+    """
+    required = {"Brand", "Amount"}
+    if not required.issubset(df.columns):
+        return "Missing required columns: Brand/Amount."
 
-    # Normalize
-    brand = brand.lower().strip()
-    channel = channel.lower().strip()
+    brand_q = str(brand).strip().lower()
+    cos_q   = str(channel_or_source).strip().lower()
 
-    filtered = df[
-        df["Brand"].str.lower().str.contains(brand, na=False) &
-        df["Channel"].str.lower().str.contains(channel, na=False)
-    ]
+    use_source = ("Source" in df.columns) and (cos_q in {"online", "offline"})
+    col = "Source" if use_source else ("Channel" if "Channel" in df.columns else None)
+    if col is None:
+        return "Neither Source nor Channel available in the dataset."
 
+    brand_mask = df["Brand"].astype(str).str.lower().str.contains(brand_q, na=False)
+    col_mask   = df[col].astype(str).str.lower().str.contains(cos_q,   na=False)
+
+    filtered = df[brand_mask & col_mask]
     if filtered.empty:
-        return f"No data found for brand '{brand.title()}' on channel '{channel.title()}'."
+        nice_col = "Source" if use_source else "Channel"
+        return f"No data found for brand '{brand}' with {nice_col}='{channel_or_source}'."
+
+    if not pd.api.types.is_numeric_dtype(filtered["Amount"]):
+        filtered["Amount"] = pd.to_numeric(filtered["Amount"], errors="coerce").fillna(0)
 
     total = filtered["Amount"].sum()
-    return f"Total spend by **{brand.title()}** on **{channel.title()}** is **${total:,.2f}**."
+    label = "Online/Offline (Source)" if use_source else "Channel"
+    return f"Total spend by **{brand}** on **{channel_or_source}** ({label}) is **${total:,.2f}**."
+
 
 
 # Updated function to extract filters from query
@@ -1437,106 +1451,108 @@ def format_spend_response(spend, filters):
     return f"**The total spend for your specified criteria was ${spend:,.2f}.**{filters_text}"
 
 # New generic handler for complex queries
-def handle_complex_query(query=None, filters_dict=None): # Added filters_dict parameter
+def handle_complex_query(query=None, filters_dict=None):  # Added filters_dict parameter
     logger.info(f"DEBUG: Entering handle_complex_query. Query param: '{query}', filters_dict param: {filters_dict}")
     
-    # Initialize response_text at the beginning of the function
     response_text = ""
-
-    # Extract possible brand + channel from query
-    brand, _ = find_entity_fuzzy(query, df["Brand"].dropna().unique())
-    channel, _ = find_entity_fuzzy(query, df["Channel"].dropna().unique())
-
-    if brand and channel:
-        return get_total_spend_by_brand_and_channel(df, brand, channel)
-
-
 
     # Determine the base DataFrame to apply filters to
     if st.session_state.current_filtered_df is not None and not st.session_state.current_filtered_df.empty:
         base_df = st.session_state.current_filtered_df.copy()
         logger.info("Using current_filtered_df as base for complex query.")
     else:
-        base_df = st.session_state.processed_df.copy() # Use the full processed_df
+        base_df = st.session_state.processed_df.copy()  # Use the full processed_df
         logger.info("Using full processed_df as base for complex query.")
 
     logger.info(f"DEBUG: Initial base_df shape in handle_complex_query: {base_df.shape}")
     st.sidebar.write(f"DEBUG - handle_complex_query: Initial base_df shape: {base_df.shape}")
 
+    # ==== ONLINE/OFFLINE spend by BRAND fast-path ====
+    ql = (query or "").lower()
+    if "spend" in ql and ("online" in ql or "offline" in ql):
+        if "Brand" in base_df.columns:
+            # quick brand guess via substring; replace with your stronger extractor if you have one
+            brand_guess = next(
+                (b for b in base_df["Brand"].dropna().unique()
+                 if isinstance(b, str) and b.lower() in ql),
+                None
+            )
+            if brand_guess:
+                which = "online" if "online" in ql else "offline"
+                resp = get_total_spend_by_brand_and_channel(base_df, brand_guess, which)
+                if isinstance(resp, str) and resp and not resp.lower().startswith("no "):
+                    return resp
+    # ==== END fast-path ====
 
-    if filters_dict: # If filters are provided directly (from sidebar)
+    # --- Sidebar filters path ---
+    if filters_dict:  # If filters are provided directly (from sidebar)
         filters = {k: v for k, v in filters_dict.items() if v != "All" and v is not None}
         if not filters:
-            # If no filters selected from sidebar, clear current_filtered_df and return total spend of full data
             st.session_state.current_filtered_df = None
-            total_spend = st.session_state.processed_df["Amount"].sum() # Use the original full df for this total
+            total_spend = st.session_state.processed_df["Amount"].sum()
             return f"No specific filters selected. The total spend for the entire dataset is **${total_spend:,.2f}**."
-    elif query: # If filters need to be extracted from a query string
-        # Prepare lists of unique entities for fuzzy matching from the *base_df*
-        brands_in_data = base_df["Brand"].dropna().unique().tolist() if "Brand" in base_df.columns else []
-        sectors_in_data = base_df["Sector"].dropna().unique().tolist() if "Sector" in base_df.columns else []
-        sources_in_data = base_df["Source"].dropna().unique().tolist() if "Source" in base_df.columns else []
-        categories_in_data = base_df["Category"].dropna().unique().tolist() if "Category" in base_df.columns else []
-        products_in_data = base_df["Product"].dropna().unique().tolist() if "Product" in base_df.columns else []
-        media_in_data = base_df["Media"].dropna().unique().tolist() if "Media" in base_df.columns else []
-        agencies_in_data = base_df["Media Agency"].dropna().unique().tolist() if "Media Agency" in base_df.columns else [] 
-        producers_in_data = base_df["Producer"].dropna().unique().tolist() if "Producer" in base_df.columns else []
-        countries_in_data = base_df["Country"].dropna().unique().tolist() if "Country" in base_df.columns else []
-        channels_in_data = base_df["Channel"].dropna().unique().tolist() if "Channel" in base_df.columns else [] 
+    elif query:  # Extract filters from query text
+        brands_in_data    = base_df["Brand"].dropna().unique().tolist()    if "Brand"   in base_df.columns else []
+        sectors_in_data   = base_df["Sector"].dropna().unique().tolist()   if "Sector"  in base_df.columns else []
+        sources_in_data   = base_df["Source"].dropna().unique().tolist()   if "Source"  in base_df.columns else []
+        categories_in_data= base_df["Category"].dropna().unique().tolist() if "Category"in base_df.columns else []
+        products_in_data  = base_df["Product"].dropna().unique().tolist()  if "Product" in base_df.columns else []
+        media_in_data     = base_df["Media"].dropna().unique().tolist()    if "Media"   in base_df.columns else []
+        agencies_in_data  = base_df["Media Agency"].dropna().unique().tolist() if "Media Agency" in base_df.columns else []
+        producers_in_data = base_df["Producer"].dropna().unique().tolist() if "Producer"in base_df.columns else []
+        countries_in_data = base_df["Country"].dropna().unique().tolist()  if "Country" in base_df.columns else []
+        channels_in_data  = base_df["Channel"].dropna().unique().tolist()  if "Channel" in base_df.columns else []
 
-        filters = extract_filters_from_query(query, base_df.columns.tolist(),
-                                             brands_in_data, sectors_in_data, sources_in_data,
-                                             categories_in_data, products_in_data, media_in_data,
-                                             agencies_in_data, producers_in_data, countries_in_data,
-                                             channels_in_data) 
+        filters = extract_filters_from_query(
+            query, base_df.columns.tolist(),
+            brands_in_data, sectors_in_data, sources_in_data,
+            categories_in_data, products_in_data, media_in_data,
+            agencies_in_data, producers_in_data, countries_in_data,
+            channels_in_data
+        )
+
+        # contextual understanding
         contextual_filters = infer_contextual_filters(query, base_df, st.session_state.column_mapping)
         filters.update(contextual_filters)
 
-        # 🌙 Detect all months mentioned in the query (e.g., compare April and January)
-        months_in_query = [month for month in calendar.month_name[1:] if month.lower() in query.lower()]
+        # Detect all months mentioned in the query -> list of months
+        months_in_query = [month for month in calendar.month_name[1:] if month.lower() in ql]
         if months_in_query and 'Month_str' in base_df.columns:
-            filters['Month_str'] = months_in_query  # list of months instead of just one
+            filters['Month_str'] = months_in_query
             logger.info(f"Month filter(s) applied from query: {months_in_query}")
 
-
-
-        # 👇 STEP 2: Override conflicting filters with contextual understanding
+        # Override conflicting filters with contextual understanding
         if contextual_filters:
             for key in contextual_filters:
-                filters[key] = contextual_filters[key]  # override with context
+                filters[key] = contextual_filters[key]
 
-        # Optional cleanup: Remove Brand/Producer if they weren’t in context but were guessed
+        # Optional cleanup: remove Brand/Producer if not supported by context
         for bad_col in ['Brand', 'Producer']:
             actual_col = st.session_state.column_mapping.get(bad_col)
             if actual_col in filters and actual_col not in contextual_filters:
                 del filters[actual_col]
 
-
         if not filters:
-            # If no filters identified from query, clear current_filtered_df and return total spend of full data
             st.session_state.current_filtered_df = None
-            total_spend = st.session_state.processed_df["Amount"].sum() # Use the original full df for this total
-            return f"I couldn't identify any specific filters (like brand, sector, year, etc.) in your query to perform a detailed analysis. The total spend for the entire dataset is **${total_spend:,.2f}**. Can you please be more specific?"
+            total_spend = st.session_state.processed_df["Amount"].sum()
+            return ( "I couldn't identify any specific filters (like brand, sector, year, etc.) in your query to perform a detailed analysis. "
+                     f"The total spend for the entire dataset is **${total_spend:,.2f}**. Can you please be more specific?" )
     else:
         return "No query or filters provided for complex analysis."
 
     logger.info(f"DEBUG: Filters identified/received in handle_complex_query: {filters}")
     st.sidebar.write(f"DEBUG - handle_complex_query: Filters identified/received: {filters}")
 
+    # --- Apply filters & respond ---
     try:
-        # Apply filters
         filtered_df = base_df.copy()
         for key, value in filters.items():
             if key in filtered_df.columns:
                 filtered_df = filtered_df[filtered_df[key] == value]
 
-        # Save to session for further use
         st.session_state.current_filtered_df = filtered_df.copy()
 
-        # Calculate spend
         spend_total = filtered_df["Amount"].sum() if "Amount" in filtered_df.columns else 0
-
-        # Format response using Patch 4 logic
         response = format_spend_response(spend_total, filters)
         return response
 
@@ -1544,7 +1560,9 @@ def handle_complex_query(query=None, filters_dict=None): # Added filters_dict pa
         logger.error(f"Error during spend calculation: {e}")
         return "An error occurred while trying to perform that analysis. I'll try to give a general answer."
 
+
     # Apply the extracted filters to the base_df
+
     filtered_df = apply_dynamic_filters(base_df, filters)
     logger.info(f"DEBUG: Filtered df shape after apply_dynamic_filters: {filtered_df.shape}")
     logger.info(f"DEBUG: Columns of DataFrame after filtering: {filtered_df.columns.tolist()}")
