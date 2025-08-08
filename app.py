@@ -2446,6 +2446,71 @@ if uploaded_file is not None:
                 else:
                     st.session_state.data_loaded = False
                     st.session_state.data_mapped = False
+        # --- Manual mapping fallback UI (borrowed from v12 style) ---
+        if not is_already_correct_format and not st.session_state.data_mapped and not st.session_state.skip_mapping_ui:
+            st.warning("We couldn’t recognize all required columns. Please map them manually.")
+            df_columns = list(st.session_state.raw_df.columns)
+
+            # Initialize mapping dict in session
+            if "column_mapping" not in st.session_state or not isinstance(st.session_state.column_mapping, dict):
+                st.session_state.column_mapping = {col: None for col in ALL_INTERNAL_COLUMNS}
+
+            # Build options
+            base_options = ["-- Select a column --"]
+            options_optional = base_options + ["-- Do not map this column --"] + df_columns
+            options_required = base_options + df_columns
+
+            all_core_mapped_manual = True
+
+            # Draw selectboxes for each internal column
+            for internal_col in ALL_INTERNAL_COLUMNS:
+                # prefer any prefilled mapping in session
+                current_mapped_col = st.session_state.column_mapping.get(internal_col)
+                if internal_col in CORE_REQUIRED_COLUMNS:
+                    options = options_required
+                else:
+                    options = options_optional
+
+                # compute default index
+                if current_mapped_col in df_columns:
+                    initial_index = options.index(current_mapped_col) if current_mapped_col in options else 0
+                elif current_mapped_col is None and internal_col not in CORE_REQUIRED_COLUMNS and "-- Do not map this column --" in options:
+                    initial_index = options.index("-- Do not map this column --")
+                else:
+                    initial_index = 0
+
+                selected_column = st.selectbox(
+                    f"Map '{internal_col}' to:",
+                    options,
+                    index=initial_index,
+                    key=f"map_{internal_col}"
+                )
+
+                # Update mapping in session
+                if selected_column == "-- Select a column --":
+                    st.session_state.column_mapping[internal_col] = None
+                    if internal_col in CORE_REQUIRED_COLUMNS:
+                        all_core_mapped_manual = False
+                elif selected_column == "-- Do not map this column --":
+                    st.session_state.column_mapping[internal_col] = None
+                else:
+                    st.session_state.column_mapping[internal_col] = selected_column
+
+            # Confirm and load
+            if all_core_mapped_manual and st.button("Confirm Columns and Load Data"):
+                with st.spinner("Applying mapping and processing data..."):
+                    st.session_state.processed_df = load_and_map_data(uploaded_file, st.session_state.column_mapping)
+                    if st.session_state.processed_df is not None:
+                        st.session_state.data_loaded = True
+                        st.session_state.data_mapped = True
+                        st.session_state.current_filtered_df = st.session_state.processed_df.copy()
+                        st.success("✅ Data loaded with your manual mapping. You can now ask questions.")
+                        st.rerun()
+                    else:
+                        st.error("Failed to process the file with the provided mapping. Please verify your selections.")
+            elif not all_core_mapped_manual:
+                st.info("Please map all required fields before continuing: " + ", ".join(CORE_REQUIRED_COLUMNS))
+
     except Exception as e:
         st.error(f"❌ Error reading uploaded file to determine columns: {e}. Please ensure it's a valid Excel file.")
         st.session_state.data_loaded = False
