@@ -95,6 +95,37 @@ except ImportError:
     config = Config()
 # --- End Inline Configuration ---
 
+# === Column resolver helper ===
+def _norm(s: str) -> str:
+    return str(s).strip().lower().replace("_", " ").replace("-", " ")
+
+def resolve_col(df, logical_col: str):
+    # case/space/underscore-insensitive lookup + aliases
+    idx = {_norm(c): c for c in df.columns}
+    want = _norm(logical_col)
+    if want in idx:
+        return idx[want]
+
+    aliases = {
+        "amount": {"spend", "cost", "value", "amount usd", "total spend"},
+        "sector": {"industry"},
+        "brand": {"advertiser"},
+        "channel": {"placement", "media channel"},
+        "source": {"platform", "publisher"},
+        "country": {"market"},
+        "category": {"sub category", "subcategory"},
+        "date": {"transaction date", "day"},
+        "month": {"month name", "month str", "monthname"},
+        "year": {"yr", "fiscal year"},
+    }
+
+    # try aliases for the target
+    for alt in [logical_col, *aliases.get(want, set())]:
+        nalt = _norm(alt)
+        if nalt in idx:
+            return idx[nalt]
+    return None
+
 
 # --- Logging Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -520,58 +551,139 @@ def top_n_sectors_by_spend(df, top_n=3):
         result += f"{i}. {sector} — ${amount:,.2f}\n"
     return result
 
-def get_top_sectors(n=3, ascending=False):
+def get_top_sectors(n=3, ascending=False, use_filters=False, show_chart=True):
     """
-    FIXED: Implements user-provided logic for getting top sectors.
-    Returns the top N or lowest N sectors by total spend.
+    Returns a sentence AND (optionally) shows a bar chart of top/bottom N sectors by spend.
     """
-    # Use the full processed_df for these "top N" calculations
-    data_to_analyze = st.session_state.processed_df
-    if data_to_analyze is None:
+    import pandas as pd, altair as alt, streamlit as st
+
+    df = st.session_state.get("processed_df")
+    if df is None or df.empty:
         return "No data available."
-    
-    # For simplicity, this fix focuses on "top N". The `ascending` flag is ignored.
-    return top_n_sectors_by_spend(data_to_analyze, top_n=n)
 
-def get_top_n_by_column(column_name, n=5, ascending=False):
-    """
-    Returns the top N or lowest N items by total spend for a given categorical column,
-    and generates a plot.
-    """
-    # Use the full processed_df for these "top N" calculations
-    data_to_analyze = st.session_state.processed_df
+    sector_col = resolve_col(df, "Sector") or resolve_col(df, "Industry")
+    amount_col = resolve_col(df, "Amount")
+    if not sector_col or not amount_col:
+        return "Required columns not found (need Sector/Amount)."
 
-    if data_to_analyze is None or data_to_analyze.empty:
-        return "No data available to perform this analysis. Please upload your data first."
-    if column_name not in data_to_analyze.columns:
-        return f"Column '{column_name}' not available in the dataset for this analysis."
-    
-    # Ensure 'Amount' column is numeric before summing
-    if not pd.api.types.is_numeric_dtype(data_to_analyze['Amount']):
-        data_to_analyze['Amount'] = pd.to_numeric(data_to_analyze['Amount'], errors='coerce').fillna(0)
+    if use_filters:
+        filters = st.session_state.get("filters") or st.session_state.get("active_filters") or {}
+        try:
+            df = apply_dynamic_filters(df, filters or {})
+        except Exception:
+            pass
+        if df is None or df.empty:
+            return "No data available after filtering."
 
-    # Group and sum first
-    grouped_data = data_to_analyze.groupby(column_name)["Amount"].sum().reset_index()
-    grouped_data.columns = [column_name, 'Total Spend'] # Rename columns for clarity
+    df[amount_col] = pd.to_numeric(df[amount_col], errors="coerce").fillna(0)
 
-    # Filter out zero-spend entries *after* grouping and summing
-    filtered_grouped_data = grouped_data[grouped_data['Total Spend'] > 0]
+    grouped = (
+        df.groupby(sector_col, dropna=False)[amount_col]
+          .sum()
+          .reset_index()
+          .rename(columns={sector_col: "Sector", amount_col: "Total Spend"})
+    )
 
-    if filtered_grouped_data.empty:
-        return f"No {column_name.lower()} with non-zero total spend found in the dataset to analyze."
+    if grouped.empty:
+        return "No sectors found to rank."
 
-    top_n_data = filtered_grouped_data.sort_values("Total Spend", ascending=ascending).head(n)
+    nz = grouped[grouped["Total Spend"] > 0]
+    data = nz if not nz.empty else grouped
+    top_n_data = (data.sort_values("Total Spend", ascending=ascending)
+                       .head(int(n)))
 
     if top_n_data.empty:
-        return f"No {column_name.lower()} found in the dataset to analyze after excluding zero spend."
+        return "No sectors found after aggregation."
 
-    if ascending:
-        response_text = f"Here are the lowest {n} {column_name.lower()} by total spend (excluding zero spend):\n"
-    else:
-        response_text = f"Here are the top {n} {column_name.lower()} by total spend (excluding zero spend):\n"
-    
-    for index, row in top_n_data.iterrows():
-        response_text += f"- **{row[column_name].title()}**: ${row['Total Spend']:,.2f}\n"
+    # ---- chart (Altair) ----
+    if show_chart:
+        order = alt.SortField(field="Total Spend", order="ascending" if ascending else "descending")
+        chart = (
+            alt.Chart(top_n_data)
+            .mark_bar()
+            .encode(
+                x=alt.X("Total Spend:Q", title="Total Spend"),
+                y=alt.Y("Sector:N", sort=order, title="Sector"),
+                tooltip=["Sector:N", alt.Tooltip("Total Spend:Q", format=",.2f")]
+            )
+            .properties(height=max(180, 30 * len(top_n_data)), width="container")
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+    direction = "lowest" if ascending else "top"
+    lines = [f"Here are the {direction} {n} sectors by total spend:"]
+    for _, row in top_n_data.iterrows():
+        lines.append(f"- **{row['Sector']}**: ${row['Total Spend']:,.2f}")
+    return "\n".join(lines)
+
+
+def get_top_n_by_column(column_name, n=5, ascending=False, use_filters=False, show_chart=True):
+    """
+    Returns a sentence AND (optionally) shows a bar chart of top/bottom N items for a given column.
+    """
+    import pandas as pd, altair as alt, streamlit as st
+
+    df = st.session_state.get("processed_df")
+    if df is None or df.empty:
+        return "No data available to perform this analysis. Please upload your data first."
+
+    col_resolved = resolve_col(df, column_name) or resolve_col(df, column_name.title())
+    amount_col = resolve_col(df, "Amount")
+    if not col_resolved or not amount_col:
+        return f"Column '{column_name}' not available in the dataset for this analysis."
+
+    if use_filters:
+        filters = st.session_state.get("filters") or st.session_state.get("active_filters") or {}
+        try:
+            df = apply_dynamic_filters(df, filters or {})
+        except Exception:
+            pass
+        if df is None or df.empty:
+            return f"No {column_name.lower()} available after filtering."
+
+    df[amount_col] = pd.to_numeric(df[amount_col], errors="coerce").fillna(0)
+
+    grouped = (
+        df.groupby(col_resolved, dropna=False)[amount_col]
+          .sum()
+          .reset_index()
+          .rename(columns={col_resolved: column_name, amount_col: "Total Spend"})
+    )
+
+    if grouped.empty:
+        return f"No {column_name.lower()} found to rank."
+
+    nz = grouped[grouped["Total Spend"] > 0]
+    data = nz if not nz.empty else grouped
+    top_n_data = (data.sort_values("Total Spend", ascending=ascending)
+                       .head(int(n)))
+
+    if top_n_data.empty:
+        return f"No {column_name.lower()} found after aggregation."
+
+    # ---- chart (Altair) ----
+    if show_chart:
+        order = alt.SortField(field="Total Spend", order="ascending" if ascending else "descending")
+        chart = (
+            alt.Chart(top_n_data)
+            .mark_bar()
+            .encode(
+                x=alt.X("Total Spend:Q", title="Total Spend"),
+                y=alt.Y(f"{column_name}:N", sort=order, title=column_name),
+                tooltip=[f"{column_name}:N", alt.Tooltip("Total Spend:Q", format=",.2f")]
+            )
+            .properties(height=max(180, 30 * len(top_n_data)), width="container")
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+    direction = "lowest" if ascending else "top"
+    lines = [f"Here are the {direction} {n} {column_name.lower()} by total spend:"]
+    for _, row in top_n_data.iterrows():
+        label = str(row[column_name])
+        lines.append(f"- **{label}**: ${row['Total Spend']:,.2f}")
+    return "\n".join(lines)
+
+
 
     # Create a bar chart
     fig = px.bar(top_n_data, x=column_name, y='Total Spend',
@@ -1466,6 +1578,28 @@ def handle_complex_query(query=None, filters_dict=None):  # Added filters_dict p
 
     logger.info(f"DEBUG: Initial base_df shape in handle_complex_query: {base_df.shape}")
     st.sidebar.write(f"DEBUG - handle_complex_query: Initial base_df shape: {base_df.shape}")
+
+    import re
+
+    # --- short-circuit: "top/bottom N sectors" ---
+    q = query.lower().strip()
+    m = re.search(r'\b(top|bottom|lowest)\s+(\d+)\s+sectors?\b', q)
+    if m:
+        n = int(m.group(2))
+        lowest = m.group(1) in ("bottom", "lowest")
+        # If you want to respect current filters, set use_filters=True
+        resp = get_top_sectors(n=n, ascending=lowest, use_filters=False)
+        return resp  # or: response_text = resp; return response_text
+
+    # --- short-circuit: "top/bottom N <column> by spend" ---
+    m2 = re.search(r'\b(top|bottom|lowest)\s+(\d+)\s+([a-zA-Z &/]+?)\s+by\s+spend\b', q)
+    if m2:
+        n = int(m2.group(2))
+        lowest = m2.group(1) in ("bottom", "lowest")
+        col = m2.group(3).strip().title()  # e.g., "Sector", "Category", "Brand"
+        resp = get_top_n_by_column(column_name=col, n=n, ascending=lowest, use_filters=False)
+        return resp  # or: response_text = resp; return response_text
+
 
     # ==== ONLINE/OFFLINE spend by BRAND fast-path ====
     ql = (query or "").lower()
