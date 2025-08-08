@@ -15,9 +15,6 @@ import plotly.express as px
 from difflib import get_close_matches
 
 
-
-
-
 # --- Library Imports with Error Handling ---
 try:
     import dateparser
@@ -94,6 +91,245 @@ except ImportError:
         ]
     config = Config()
 # --- End Inline Configuration ---
+# --- list-all utilities ---
+def _list_all_by_role(role: str, alt_roles=None, df=None, title=None, show_table=True):
+    import streamlit as st
+    import pandas as pd
+
+    df = df if df is not None else st.session_state.get("processed_df")
+    if df is None or df.empty:
+        return f"No data available to list {role.lower()}."
+
+    # resolve logical column → actual column
+    alt_roles = alt_roles or []
+    col = resolve_col(df, role)
+    if not col:
+        for r in alt_roles:
+            col = resolve_col(df, r)
+            if col:
+                break
+    if not col:
+        return f"No column found for {role}."
+
+    vals = (
+        df[col]
+        .dropna()
+        .astype(str)
+        .map(str.strip)
+        .replace("", pd.NA)
+        .dropna()
+        .unique()
+        .tolist()
+    )
+    vals = sorted(vals, key=str.casefold)
+    if show_table:
+        try:
+            st.dataframe({(title or role): vals}, use_container_width=True)
+        except Exception:
+            pass
+    return f"Found {len(vals)} {(title or role).lower()}."
+
+def list_all_brands(df=None, show_table=True):
+    import pandas as pd, streamlit as st
+    df = df if df is not None else st.session_state.get("processed_df")
+    if df is None or df.empty:
+        return "No data available."
+    col = resolve_col(df, "Brand") or resolve_col(df, "Advertiser")
+    if not col:
+        return "No Brand/Advertiser column found."
+    vals = (
+        df[col].dropna().astype(str).map(str.strip)
+              .replace("", pd.NA).dropna().unique().tolist()
+    )
+    vals = sorted(vals, key=lambda s: s.casefold())
+    if show_table:
+        st.dataframe(pd.DataFrame({"Brand": vals}), use_container_width=True)
+    return f"Found {len(vals)} brands."
+
+def list_all_sectors(df=None, show_table=True):
+    import pandas as pd, streamlit as st
+    df = df if df is not None else st.session_state.get("processed_df")
+    if df is None or df.empty:
+        return "No data available."
+    col = resolve_col(df, "Sector") or resolve_col(df, "Industry")
+    if not col:
+        return "No Sector/Industry column found."
+    vals = (
+        df[col].dropna().astype(str).map(str.strip)
+              .replace("", pd.NA).dropna().unique().tolist()
+    )
+    vals = sorted(vals, key=lambda s: s.casefold())
+    if show_table:
+        st.dataframe(pd.DataFrame({"Sector": vals}), use_container_width=True)
+    return f"Found {len(vals)} sectors."
+
+
+def list_all_channels(df=None, show_table=True):
+    # try Channel → Media → Platform → Source
+    return _list_all_by_role("Channel", alt_roles=["Media", "Platform", "Source", "Media Channel", "Placement"],
+                             df=df, title="Channel/Platform", show_table=show_table)
+
+def list_all_categories(df=None, show_table=True):
+    return _list_all_by_role("Category", alt_roles=["Sub Category", "Subcategory"], df=df, title="Category", show_table=show_table)
+
+def list_all_sources(df=None, show_table=True):
+    return _list_all_by_role("Source", alt_roles=["Platform", "Publisher"], df=df, title="Source", show_table=show_table)
+
+def ensure_channel_column(df):
+    """
+    Ensures the dataset has a 'Channel' column.
+    If there is no 'Channel' column, tries to resolve it from similar names.
+    """
+    possible_channel_names = ["Channel", "Media Channel", "Platform"]
+    for col in df.columns:
+        if col.strip().lower() in [name.lower() for name in possible_channel_names]:
+            df = df.rename(columns={col: "Channel"})
+            break
+    if "Channel" not in df.columns:
+        raise ValueError("No column found that matches a Channel field.")
+    return df
+
+# --- platform normalization + brand/platform answer ---
+_PLATFORM_ALIASES = {
+    "instagram": {"insta"},
+    "facebook": {"fb", "meta"},
+    "twitter": {"x"},
+    "youtube": set(),
+    "tiktok": set(),
+    "snapchat": {"snap"},
+    "linkedin": {"ln", "li"},
+    "google": {"google ads", "adwords"},
+    "bing": set(),
+    "reddit": set(),
+    "pinterest": set(),
+}
+
+def _canon_platform(s: str) -> str:
+    s = str(s).strip().lower()
+    for canon, aliases in _PLATFORM_ALIASES.items():
+        if s == canon or s in aliases:
+            return canon
+    return s
+
+def answer_brand_spend_via(brand: str, platform: str, df=None, show_table: bool=False, debug: bool=False):
+    """
+    Compute spend for Brand + platform, where platform may live in Channel/Media/Source/Platform/Placement.
+    Robust brand + platform matching with aliasing and fuzzy fallback.
+    """
+    import pandas as pd
+    import difflib
+    import streamlit as st
+
+    df = df if df is not None else st.session_state.get("processed_df")
+    if df is None or df.empty:
+        return "No data available."
+
+    # ensure a Channel-like column exists if possible
+    try:
+        df = ensure_channel_column(df)
+    except Exception:
+        pass
+
+    amt_col   = resolve_col(df, "Amount")
+    brand_col = resolve_col(df, "Brand")
+    # Prefer platform specificity: Channel > Media > Source > Platform > Placement
+    cand_cols = [
+        resolve_col(df, "Channel"),
+        resolve_col(df, "Media"),
+        resolve_col(df, "Source"),
+        resolve_col(df, "Platform"),
+        resolve_col(df, "Placement"),
+    ]
+    cand_cols = [c for c in cand_cols if c]
+
+    if not amt_col or not brand_col or not cand_cols:
+        return "Missing required columns (need Amount, Brand, and a platform column like Channel/Media/Source)."
+
+    # Canonicalize platform query
+    plat_q = _canon_platform(platform)
+
+    # Figure out WHICH column actually contains that platform
+    platform_col = None
+    for c in cand_cols:
+        vals = df[c].dropna().astype(str).str.strip().str.casefold()
+        # try canonical equality
+        if (vals.map(_canon_platform) == plat_q).any():
+            platform_col = c
+            break
+        # try simple substring contains
+        if vals.str.contains(plat_q, na=False).any():
+            platform_col = c
+            break
+    # fuzzy fallback across all candidate columns
+    if platform_col is None:
+        all_vals = []
+        for c in cand_cols:
+            all_vals.extend(df[c].dropna().astype(str).unique().tolist())
+        # canon the uniques for match
+        canon_uniques = list({_canon_platform(v.lower().strip()): v for v in all_vals}.items())  # (canon, raw)
+        choices = [cu[0] for cu in canon_uniques]
+        match = difflib.get_close_matches(plat_q, choices, n=1, cutoff=0.8)
+        if match:
+            # find which raw value matched; then which column has it
+            matched_canon = match[0]
+            raw_match = next(v for k,v in canon_uniques if k == matched_canon)
+            for c in cand_cols:
+                if raw_match in df[c].astype(str).values:
+                    platform_col = c
+                    plat_q = matched_canon   # use canon going forward
+                    break
+
+    if platform_col is None:
+        return f"I couldn’t find a platform column containing **{platform}**."
+
+    # Build a working frame
+    use = df[[brand_col, platform_col, amt_col]].copy()
+    use[amt_col] = pd.to_numeric(use[amt_col], errors="coerce").fillna(0)
+
+    # Brand match: exact (casefold) -> contains -> fuzzy
+    bq = str(brand).strip().casefold()
+    mask_brand = use[brand_col].astype(str).str.strip().str.casefold() == bq
+    if not mask_brand.any():
+        contains = use[brand_col].astype(str).str.casefold().str.contains(rf"\b{re.escape(bq)}\b", na=False)
+        if contains.any():
+            mask_brand = contains
+        else:
+            brands = use[brand_col].dropna().astype(str).unique().tolist()
+            cand = difflib.get_close_matches(brand, brands, n=1, cutoff=0.8)
+            if cand:
+                mask_brand = use[brand_col].astype(str) == cand[0]
+
+    # Platform match: canon eq OR contains
+    plat_series = use[platform_col].astype(str).str.strip().str.casefold()
+    mask_plat = (plat_series.map(_canon_platform) == plat_q) | (plat_series.str.contains(plat_q, na=False))
+
+    filtered = use[mask_brand & mask_plat]
+    total = float(filtered[amt_col].sum())
+
+    if show_table:
+        try:
+            st.dataframe(filtered, use_container_width=True)
+        except Exception:
+            pass
+
+    if debug:
+        try:
+            st.sidebar.write({
+                "DEBUG_brand_col": brand_col,
+                "DEBUG_platform_col_used": platform_col,
+                "DEBUG_platform_query": platform,
+                "DEBUG_platform_canon": plat_q,
+                "DEBUG_rows_matched": len(filtered),
+                "DEBUG_total": total,
+            })
+        except Exception:
+            pass
+
+    if total <= 0:
+        return f"I didn’t find positive spend for **{brand}** via **{platform.title()}** (looked in `{platform_col}`)."
+    return f"**{brand}** spend via **{platform.title()}**: ${total:,.2f}"
+
+
 
 # === Column resolver helper ===
 def _norm(s: str) -> str:
@@ -1580,9 +1816,38 @@ def handle_complex_query(query=None, filters_dict=None):  # Added filters_dict p
     st.sidebar.write(f"DEBUG - handle_complex_query: Initial base_df shape: {base_df.shape}")
 
     import re
+    q_raw = (query or "")
+    q = q_raw.lower().strip()
 
+    if re.fullmatch(r'(list|show)\s+all\s+brands', q):
+        return list_all_brands()
+    if re.fullmatch(r'(list|show)\s+all\s+sectors', q):
+        return list_all_sectors()
     # --- short-circuit: "top/bottom N sectors" ---
     q = query.lower().strip()
+    # --- SHORTCUT: list/show all ... (must be before any fuzzy/entity parsing) ---
+    if re.fullmatch(r'(list|show)\s+all\s+brands', q):
+        st.sidebar.write("DEBUG: shortcut list_all_brands hit")
+        return list_all_brands()
+    if re.fullmatch(r'(list|show)\s+all\s+sectors', q):
+        st.sidebar.write("DEBUG: shortcut list_all_sectors hit")
+        return list_all_sectors()
+    # (add others later if you want)
+
+        # --- shortcut: "list/show all ..." ---
+    if re.fullmatch(r'(list|show)\s+all\s+brands', q):
+        return list_all_brands()
+    if re.fullmatch(r'(list|show)\s+all\s+sectors', q):
+        return list_all_sectors()
+    if re.fullmatch(r'(list|show)\s+all\s+channels', q):
+        # Optional: you can add list_all_channels() if you’ve implemented it
+        return "Listing channels isn’t wired yet. Add list_all_channels() if needed."
+    if re.fullmatch(r'(list|show)\s+all\s+categories', q):
+        # Optional: you can add list_all_categories() if you’ve implemented it
+        return "Listing categories isn’t wired yet. Add list_all_categories() if needed."
+    if re.fullmatch(r'(list|show)\s+all\s+sources', q):
+        # Optional: you can add list_all_sources() if you’ve implemented it
+        return "Listing sources isn’t wired yet. Add list_all_sources() if needed."
     m = re.search(r'\b(top|bottom|lowest)\s+(\d+)\s+sectors?\b', q)
     if m:
         n = int(m.group(2))
@@ -1599,6 +1864,19 @@ def handle_complex_query(query=None, filters_dict=None):  # Added filters_dict p
         col = m2.group(3).strip().title()  # e.g., "Sector", "Category", "Brand"
         resp = get_top_n_by_column(column_name=col, n=n, ascending=lowest, use_filters=False)
         return resp  # or: response_text = resp; return response_text
+    
+    # --- shortcut: "<brand> spend via|on|through <platform>" ---
+    m_bp = re.search(r'^\s*([a-z0-9&\-\.\' ]+?)\s+spend\s+(?:via|on|through)\s+([a-z0-9&\-\.\' ]+)\s*$', q)
+    if m_bp:
+        brand_txt = m_bp.group(1).strip()
+        plat_txt  = m_bp.group(2).strip()
+        # Use base df if you have it, else session_state
+        try:
+            base = base_df  # if your function defines/uses base_df
+        except NameError:
+            base = None
+        return answer_brand_spend_via(brand_txt, plat_txt, df=base, show_table=False)
+
 
 
     # ==== ONLINE/OFFLINE spend by BRAND fast-path ====
@@ -2878,13 +3156,6 @@ if st.session_state.data_loaded and st.session_state.data_mapped and df is not N
                 <li>"Compare spend of Dubai Duty Free vs Daiso Japan"</li>
                 <li>"What are the top 3 sectors by spend??"</li>
                 <li>"What are the top 5 brands by spend?"</li>
-                <li>"Predict spend for next week"</li>
-                <li>"Compare January 2023 and February 2024"</li>
-                <li>"List all brands"</li>
-                <li>"List all sectors"</li>
-                <li>"What is the average of Amount?"</li>
-                <li>"Show me a histogram of Amount"</li>
-                <li>"List unique values in Source"</li>
                 <li>"What is marketing spend analysis?" (AI fallback)</li>
                 <li>"Tell me about AI in marketing." (AI fallback)</li>
             </ul>
