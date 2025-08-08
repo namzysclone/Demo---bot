@@ -3162,3 +3162,4 @@ if st.session_state.data_loaded and st.session_state.data_mapped and df is not N
         """, unsafe_allow_html=True)
 else:
     pass
+
